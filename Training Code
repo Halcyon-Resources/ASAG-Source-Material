@@ -1,0 +1,363 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
+
+
+# Reproducibility
+
+def set_seed(seed):
+    try:
+        import sympy.logic
+    except ImportError:
+        pass
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    torch.use_deterministic_algorithms(True)
+
+
+# Loading Dataset
+
+class ASAGDataset(Dataset):
+
+    def __init__(self, df, tokenizer, max_len=256):
+
+        self.df = df.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+
+        row = self.df.iloc[idx]
+
+        # Input: question + student_answer, reference_answer format
+
+        first_text = (
+            str(row["question"])
+            + " "
+            + str(row["student_answer"])
+        )
+
+        second_text = str(row["reference_answer"])
+
+        encoding = self.tokenizer(
+            first_text,
+            second_text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt"
+        )
+
+        item = {
+            k: v.squeeze(0)
+            for k, v in encoding.items()
+        }
+
+        # Gold labels
+
+        item["labels"] = torch.tensor(
+            row["true_label"],
+            dtype=torch.long
+        )
+
+        return item
+
+
+# Model
+
+class EncoderClassifier(nn.Module):
+
+    def __init__(self, model_name, num_labels):
+
+        super().__init__()
+
+        self.encoder = AutoModel.from_pretrained(model_name)
+
+        self.classifier = nn.Linear(
+            self.encoder.config.hidden_size,
+            num_labels
+        )
+
+    def forward(self, input_ids, attention_mask):
+
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        cls = outputs.last_hidden_state[:, 0]
+
+        logits = self.classifier(cls)
+
+        return logits
+
+
+# Evaluation
+
+def evaluate(model, loader, device):
+
+    model.eval()
+
+    preds = []
+    labels = []
+
+    total_loss = 0
+
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+
+        for batch in loader:
+
+            input_ids = batch["input_ids"].to(device)
+
+            attention_mask = batch["attention_mask"].to(device)
+
+            y = batch["labels"].to(device)
+
+            logits = model(
+                input_ids,
+                attention_mask
+            )
+
+            loss = criterion(logits, y)
+
+            total_loss += loss.item()
+
+            preds.extend(
+                torch.argmax(logits, dim=1)
+                .cpu()
+                .numpy()
+            )
+
+            labels.extend(
+                y.cpu().numpy()
+            )
+
+    f1 = f1_score(
+        labels,
+        preds,
+        average="macro"
+    )
+
+    return f1, total_loss / len(loader)
+
+
+# Training
+
+def train(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    lr,
+    epochs,
+    patience,
+    save_path
+):
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_f1 = -1
+
+    patience_counter = 0
+
+    for epoch in range(epochs):
+
+        model.train()
+
+        loop = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}"
+        )
+
+        for batch in loop:
+
+            input_ids = batch["input_ids"].to(device)
+
+            attention_mask = batch["attention_mask"].to(device)
+
+            y = batch["labels"].to(device)
+
+            optimizer.zero_grad()
+
+            logits = model(
+                input_ids,
+                attention_mask
+            )
+
+            loss = criterion(
+                logits,
+                y
+            )
+
+            loss.backward()
+
+            optimizer.step()
+
+            loop.set_postfix(
+                train_loss=loss.item()
+            )
+
+        val_f1, val_loss = evaluate(
+            model,
+            val_loader,
+            device
+        )
+
+        print(f"\nEpoch {epoch+1}")
+
+        print(
+            f"Val  F1: {val_f1:.4f} | "
+            f"Val Loss: {val_loss:.4f}"
+        )
+
+        if val_f1 > best_val_f1:
+
+            best_val_f1 = val_f1
+
+            patience_counter = 0
+
+            torch.save(
+                model.state_dict(),
+                save_path
+            )
+
+            print(
+                "Saved Checkpoint for the best model"
+            )
+
+        else:
+
+            patience_counter += 1
+
+            print(
+                f"No improvement detected"
+                f"{patience_counter}/{patience}"
+            )
+
+        if patience_counter >= patience:
+
+            print(
+                "Triggered Early Stopping. The best model will stay saved, discarding the progress after best model checkpoint."
+            )
+
+            break
+
+    print(
+        f"\nBest VALIDATION F1: {best_val_f1:.4f}"
+    )
+
+
+# Main section
+
+def main(seed=42):
+
+    set_seed(seed)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    # Training data and model loading
+
+    train_df_full = pd.read_excel(
+        "SciEntsBank training dataset path goes here"
+    )
+
+    # Remove hash from the model name to use specific model only
+
+    model_name = "Name of the model to use"
+
+    # Training - validation split
+
+    train_df, val_df = train_test_split(
+        train_df_full,
+        test_size=0.2,
+        random_state=seed,
+        stratify=train_df_full["true_label"]
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name
+    )
+
+    train_dataset = ASAGDataset(
+        train_df,
+        tokenizer
+    )
+
+    val_dataset = ASAGDataset(
+        val_df,
+        tokenizer
+    )
+
+    g = torch.Generator()
+
+    g.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=16,
+        shuffle=True,
+        generator=g,
+        num_workers=0
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=16,
+        shuffle=False,
+        num_workers=0
+    )
+
+    model = EncoderClassifier(
+        model_name,
+        num_labels=3
+    )
+
+    model.to(device)
+
+    train(
+        model,
+        train_loader,
+        val_loader,
+        device,
+        lr=2e-5,
+        epochs=15,
+        patience=3,
+        save_path=f"{model_name.split('/')[-1]}_seed_{seed}_02.pt"
+    )
+
+
+if __name__ == "__main__":
+
+    main(seed=42)
