@@ -1,0 +1,940 @@
+import os
+import gc
+import json
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModel
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report
+)
+from statsmodels.stats.multitest import multipletests
+
+
+####################### Paths to test sets and models #############################
+
+
+ORTHO_PATH = r"D:\ASAG FINAL\Dataset\ScientsBank\SciEntsBank_Orthographic_01all.xlsx"
+PARA_PATH  = r"D:\ASAG FINAL\Dataset\ScientsBank\SciEntsBank_Paraphrased_01all.xlsx"
+
+
+MODELS = [
+    {
+        "name": "BERT",
+        "path": r"D:\ASAG FINAL\Models\BERT\bert-base-cased_ASAG_seed42_01"
+    },
+    {
+        "name": "RoBERTa",
+        "path": r"D:\ASAG FINAL\Models\RoBERTa\roberta-base_ASAG_seed42_01"
+    },
+    {
+        "name": "DeBERTa",
+        "path": r"D:\ASAG FINAL\Models\DeBERTa\deberta-base_ASAG_seed42_01"
+    },
+    {
+        "name": "ELECTRA",
+        "path": r"D:\ASAG FINAL\Models\ELECTRA\electra-base-discriminator_ASAG_seed42_01"
+    },
+    {
+        "name": "MPNet",
+        "path": r"D:\ASAG FINAL\Models\MPNet\mpnet-base_ASAG_seed42_01"
+    }
+]
+
+########################### Necessary Configurations ##############################
+
+MAX_LENGTH = 256
+BATCH_SIZE = 16
+NUM_LABELS = 3
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("Device:", DEVICE)
+
+
+LABEL_NAMES = {
+    0: "Entailment",
+    1: "Contradiction",
+    2: "Neutral"
+}
+
+LABEL_SHORT = {
+    0: "ENT",
+    1: "CON",
+    2: "NEU"
+}
+
+######################### Loading the datasets here #############################
+
+df_ortho = pd.read_excel(ORTHO_PATH).reset_index(drop=True)
+df_para = pd.read_excel(PARA_PATH).reset_index(drop=True)
+
+
+# Make sure all text columns are clean strings
+TEXT_COLUMNS = [
+    "question",
+    "student_answer",
+    "reference_answer",
+    "corrupted_answer"
+]
+
+for df in [df_ortho, df_para]:
+    for col in TEXT_COLUMNS:
+        df[col] = (
+            df[col]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+
+print("Orthographic samples:", len(df_ortho))
+print("Paraphrase samples:", len(df_para))
+
+assert len(df_ortho) == len(df_para), \
+    "Orthographic and paraphrase datasets have different lengths."
+
+for col in ["question", "student_answer", "reference_answer", "true_label"]:
+    assert df_ortho[col].equals(df_para[col]), \
+        f"Dataset mismatch detected in column: {col}"
+
+
+########################### Loading model architecture ##########################
+
+class ASAGClassifier(nn.Module):
+
+    def __init__(self, model_dir, num_labels):
+        super().__init__()
+
+        self.encoder = AutoModel.from_pretrained(model_dir)
+
+        self.classifier = nn.Linear(
+            self.encoder.config.hidden_size,
+            num_labels
+        )
+
+    def forward(self, input_ids, attention_mask):
+
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        cls_embedding = outputs.last_hidden_state[:, 0]
+
+        logits = self.classifier(cls_embedding)
+
+        return logits
+    
+
+def load_model(model_config):
+
+    model_dir = model_config["path"]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+    with open(
+        os.path.join(model_dir, "custom_config.json"),
+        "r"
+    ) as f:
+        custom_config = json.load(f)
+
+    num_labels = custom_config["num_labels"]
+
+    model = ASAGClassifier(
+        model_dir,
+        num_labels
+    )
+    
+    print(
+        f"{model_config['name']} encoder hidden size:",
+        model.encoder.config.hidden_size
+        )
+    
+    print(
+        f"{model_config['name']} classifier:",
+        model.classifier
+        )
+
+    classifier_weights = torch.load(
+        os.path.join(model_dir, "classifier.pt"),
+        map_location=DEVICE
+    )
+
+    model.classifier.load_state_dict(classifier_weights)
+
+    model.to(DEVICE)
+    model.eval()
+
+    return model, tokenizer
+
+
+############################ The Prediction part ##################################
+
+def predict(
+    model,
+    tokenizer,
+    question_list,
+    student_answer_list,
+    reference_answer_list
+):
+
+    predictions = []
+
+    for i in tqdm(
+        range(0, len(question_list), BATCH_SIZE),
+        desc="Inference"
+    ):
+
+        batch_question = question_list[i:i + BATCH_SIZE]
+        batch_student = student_answer_list[i:i + BATCH_SIZE]
+        batch_reference = reference_answer_list[i:i + BATCH_SIZE]
+
+        first_sequence = [
+            q + " " + s
+            for q, s in zip(
+                batch_question,
+                batch_student
+            )
+        ]
+
+        encoding = tokenizer(
+            first_sequence,
+            batch_reference,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_tensors="pt"
+        )
+
+        encoding = {
+            "input_ids": encoding["input_ids"].to(DEVICE),
+            "attention_mask": encoding["attention_mask"].to(DEVICE)
+        }
+
+        with torch.no_grad():
+
+            logits = model(**encoding)
+
+            preds = torch.argmax(
+                logits,
+                dim=1
+            )
+
+        predictions.extend(
+            preds.cpu().numpy()
+        )
+
+    return np.array(predictions)
+
+
+########################### Extracting CLS Embeddings #############################
+
+def get_representations(
+    model,
+    tokenizer,
+    question_list,
+    student_answer_list,
+    reference_answer_list
+):
+
+    representations = []
+
+    for i in tqdm(
+        range(0, len(question_list), BATCH_SIZE),
+        desc="Extracting representations"
+    ):
+
+        batch_question = question_list[i:i + BATCH_SIZE]
+        batch_student = student_answer_list[i:i + BATCH_SIZE]
+        batch_reference = reference_answer_list[i:i + BATCH_SIZE]
+
+        first_sequence = [
+            q + " " + s
+            for q, s in zip(
+                batch_question,
+                batch_student
+            )
+        ]
+
+        encoding = tokenizer(
+            first_sequence,
+            batch_reference,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_tensors="pt"
+        )
+
+        encoding = {
+            "input_ids": encoding["input_ids"].to(DEVICE),
+            "attention_mask": encoding["attention_mask"].to(DEVICE)
+        }
+
+        with torch.no_grad():
+
+            outputs = model.encoder(
+                **encoding
+            )
+
+            cls_embedding = outputs.last_hidden_state[:, 0]
+
+        representations.append(
+            cls_embedding.cpu().numpy()
+        )
+
+    return np.vstack(representations)
+
+###################### Macro F1 Drop for Experiment 1 ###########################
+
+def calculate_relative_macro_f1_drop(
+    clean_macro_f1,
+    perturbed_macro_f1
+):
+
+    if clean_macro_f1 == 0:
+        raise ValueError(
+            "Clean Macro-F1 cannot be zero when calculating relative Macro-F1 drop."
+        )
+
+    return (
+        (clean_macro_f1 - perturbed_macro_f1)
+        / clean_macro_f1
+    ) * 100
+
+##################### COMPLETE EXPERIMENT 1 (Macro F1 Drop) ######################
+
+def run_experiment_1(
+    model,
+    tokenizer,
+    df,
+    student_column,
+    dataset_name
+):
+
+    y_true = df["true_label"].values
+
+    y_pred = predict(
+        model,
+        tokenizer,
+        df["question"].tolist(),
+        df[student_column].tolist(),
+        df["reference_answer"].tolist()
+    )
+
+    accuracy = accuracy_score(
+        y_true,
+        y_pred
+    )
+
+    macro_f1 = f1_score(
+        y_true,
+        y_pred,
+        average="macro"
+    )
+
+    weighted_f1 = f1_score(
+        y_true,
+        y_pred,
+        average="weighted"
+    )
+
+    print(dataset_name)
+
+    print(f"Accuracy    : {accuracy:.4f}")
+    print(f"Macro-F1    : {macro_f1:.4f}")
+    print(f"Weighted-F1 : {weighted_f1:.4f}")
+
+    print(
+        classification_report(
+            y_true,
+            y_pred,
+            target_names=[
+                LABEL_NAMES[0],
+                LABEL_NAMES[1],
+                LABEL_NAMES[2]
+            ],
+            digits=4
+        )
+    )
+
+    return {
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1
+    }
+
+######################### COMPLETE EXPERIMENT 2 (JTR) ############################
+
+def run_transition_analysis(
+    df,
+    original_predictions,
+    perturbed_predictions,
+    dataset_name
+):
+
+    df_exp2 = df.copy()
+
+    df_exp2["original_prediction"] = original_predictions
+    df_exp2["perturbed_prediction"] = perturbed_predictions
+
+    original_support = (
+        df_exp2["true_label"]
+        .value_counts()
+        .reindex(
+            [0, 1, 2],
+            fill_value=0
+        )
+        .values
+        .astype(int)
+    )
+
+    df_exp2 = df_exp2[
+        (df_exp2["semantic_preservation"] == 0)
+        &
+        (
+            df_exp2["original_prediction"]
+            ==
+            df_exp2["true_label"]
+        )
+    ].reset_index(drop=True)
+
+    print(f"JTR Analysis: {dataset_name}")
+
+    print(
+        "Complete dataset samples:",
+        len(df)
+    )
+
+    print(
+        "Fixed class support:",
+        dict(zip([0, 1, 2], original_support))
+    )
+
+    print(
+        "Samples retained for JTR:",
+        len(df_exp2)
+    )
+
+    retained_support = (
+        df_exp2["original_prediction"]
+        .value_counts()
+        .reindex(
+            [0, 1, 2],
+            fill_value=0
+        )
+        .values
+        .astype(int)
+    )
+
+    filtered_support = (
+        original_support
+        -
+        retained_support
+    )
+
+    if np.any(filtered_support < 0):
+        raise ValueError(
+            "Filtered support contains negative values. This indicates an inconsistency between the fixed class population and retained samples."
+        )
+
+    if not np.array_equal(
+        original_support,
+        retained_support + filtered_support
+    ):
+        raise ValueError(
+            "Population reconstruction failed: retained + filtered != original support."
+        )
+
+    print("\nClass population reconstruction:")
+
+    for class_idx in [0, 1, 2]:
+
+        print(
+            f"{LABEL_SHORT[class_idx]}: "
+            f"{retained_support[class_idx]} used + "
+            f"{filtered_support[class_idx]} filtered = "
+            f"{original_support[class_idx]} total"
+        )
+
+    transition_counts = pd.crosstab(
+        df_exp2["original_prediction"],
+        df_exp2["perturbed_prediction"]
+    )
+
+    transition_counts = transition_counts.reindex(
+        index=[0, 1, 2],
+        columns=[0, 1, 2],
+        fill_value=0
+    )
+
+    transition_rates = transition_counts.div(
+        transition_counts.sum(axis=1),
+        axis=0
+    ) * 100
+
+    transition_rates = transition_rates.fillna(0)
+
+    if len(df_exp2) > 0:
+
+        overall_stability = (
+            (
+                df_exp2["original_prediction"]
+                ==
+                df_exp2["perturbed_prediction"]
+            ).sum()
+            /
+            len(df_exp2)
+            *
+            100
+        )
+
+    else:
+
+        overall_stability = 0.0
+
+    print(
+        f"\nOverall Judgement Stability: "
+        f"{overall_stability:.2f}%"
+    )
+
+    print("\nJTR matrix (%):")
+
+    print(
+        transition_rates.rename(
+            index=LABEL_SHORT,
+            columns=LABEL_SHORT
+        ).round(2)
+    )
+
+    return {
+        "df_exp2": df_exp2,
+
+        "transition_rates":
+            transition_rates,
+
+        # Fixed dataset population
+        "original_support":
+            original_support,
+
+        # Samples actually entering JTR
+        "retained_support":
+            retained_support,
+
+        # Samples excluded from JTR
+        "filtered_support":
+            filtered_support,
+
+        "overall_stability":
+            overall_stability
+    }
+
+############## Complete Experiment 3 (Representation Displacement) ###############
+
+def run_experiment_3(
+    model,
+    tokenizer,
+    df_exp2,
+    perturbation_name,
+    model_name
+):
+    print(
+        f"Exp3: {model_name} | "
+        f"{perturbation_name}"
+    )
+
+
+    original_repr = get_representations(
+        model,
+        tokenizer,
+        df_exp2["question"].tolist(),
+        df_exp2["student_answer"].tolist(),
+        df_exp2["reference_answer"].tolist()
+    )
+
+    perturbed_repr = get_representations(
+        model,
+        tokenizer,
+        df_exp2["question"].tolist(),
+        df_exp2["corrupted_answer"].tolist(),
+        df_exp2["reference_answer"].tolist()
+    )
+    
+    original_norm = np.linalg.norm(
+        original_repr,
+        axis=1,
+        keepdims=True
+        )
+    
+    perturbed_norm = np.linalg.norm(
+        perturbed_repr,
+        axis=1,
+        keepdims=True
+        )
+    
+    original_normalized = (
+        original_repr /
+        np.clip(original_norm, 1e-12, None)
+        )
+    
+    perturbed_normalized = (
+        perturbed_repr /
+        np.clip(perturbed_norm, 1e-12, None)
+        )
+    
+    cosine_similarity = np.sum(
+        original_normalized *
+        perturbed_normalized,
+        axis=1
+        )
+    
+    # Numerical safeguard
+    cosine_similarity = np.clip(
+        cosine_similarity,
+        -1.0,
+        1.0
+        )
+    
+    representation_shift = (
+        1.0 - cosine_similarity
+        ) / 2.0
+
+    judgement = np.where(
+        df_exp2["original_prediction"].values
+        ==
+        df_exp2["perturbed_prediction"].values,
+
+        "Retained",
+
+        "Transitioned"
+    )
+
+    results = pd.DataFrame({
+
+        "model":
+            model_name,
+
+        "perturbation":
+            perturbation_name,
+
+        "representation_shift":
+            representation_shift,
+
+        "judgement":
+            judgement
+    })
+
+
+    print(
+        results["judgement"]
+        .value_counts()
+        .to_string()
+    )
+
+    return results
+    
+########################### Complete Pipeline Control ############################
+
+all_exp3_results = []
+
+transition_results = {}
+
+performance_results = []
+
+
+for model_config in MODELS:
+
+    model_name = model_config["name"]
+
+    print("\n\n")
+    print("#" * 80)
+    print(f"PROCESSING MODEL: {model_name}")
+    print("#" * 80)
+
+    model, tokenizer = load_model(
+        model_config
+    )
+
+    clean_results = run_experiment_1(
+        model,
+        tokenizer,
+        df_ortho,
+        "student_answer",
+        f"{model_name} — Clean"
+    )
+
+    clean_y_pred = clean_results["y_pred"]
+
+    clean_macro_f1 = (
+        clean_results["macro_f1"]
+    )
+
+    ortho_results = run_experiment_1(
+        model,
+        tokenizer,
+        df_ortho,
+        "corrupted_answer",
+        f"{model_name} — Orthographic"
+    )
+
+    ortho_y_pred = (
+        ortho_results["y_pred"]
+    )
+    
+    ortho_drop = calculate_relative_macro_f1_drop(
+        clean_macro_f1,
+        ortho_results["macro_f1"]
+        )
+
+    ortho_exp2 = run_transition_analysis(
+        df_ortho,
+        clean_y_pred,
+        ortho_y_pred,
+        "Orthographic"
+    )
+
+    ortho_exp3 = run_experiment_3(
+        model,
+        tokenizer,
+        ortho_exp2["df_exp2"],
+        "Orthographic",
+        model_name
+    )
+
+    all_exp3_results.append(
+        ortho_exp3
+    )
+
+    para_results = run_experiment_1(
+        model,
+        tokenizer,
+        df_para,
+        "corrupted_answer",
+        f"{model_name} — Paraphrase"
+    )
+
+    para_y_pred = (
+        para_results["y_pred"]
+    )
+    
+    para_drop = calculate_relative_macro_f1_drop(
+        clean_macro_f1,
+        para_results["macro_f1"]
+        )
+
+    para_exp2 = run_transition_analysis(
+        df_para,
+        clean_y_pred,
+        para_y_pred,
+        "Paraphrase"
+    )
+
+    del model
+    del tokenizer
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+    print(
+        f"\nFinished {model_name}."
+    )
+
+performance_table = pd.DataFrame(
+    performance_results
+)
+
+print("RTE ROBUSTNESS RESULTS")
+
+print(
+    performance_table.round(4).to_string(
+        index=False
+    )
+)
+
+exp3_all = pd.concat(
+    all_exp3_results,
+    ignore_index=True
+)
+
+print("EXP3 DATASET SUMMARY")
+
+print(
+    exp3_all.groupby(
+        ["model", "perturbation", "judgement"]
+    ).size()
+)
+
+print("\nModel × Perturbation sample counts:")
+print(
+    exp3_all.groupby(
+        ["model", "perturbation"]
+    ).size()
+)
+
+def rank_biserial_ci(
+    retained,
+    transitioned,
+    n_boot=5000,
+    seed=42
+):
+
+    retained = np.asarray(retained)
+    transitioned = np.asarray(transitioned)
+
+    rng = np.random.default_rng(seed)
+
+    n_retained = len(retained)
+    n_transitioned = len(transitioned)
+
+    u_obs, _ = mannwhitneyu(
+        retained,
+        transitioned,
+        alternative="two-sided",
+        method="auto"
+    )
+
+    r_obs = (
+        1 -
+        (2 * u_obs) /
+        (n_retained * n_transitioned)
+    )
+
+    bootstrap_effects = np.empty(n_boot)
+
+    for i in range(n_boot):
+
+        retained_sample = rng.choice(
+            retained,
+            size=n_retained,
+            replace=True
+        )
+
+        transitioned_sample = rng.choice(
+            transitioned,
+            size=n_transitioned,
+            replace=True
+        )
+
+        u_boot, _ = mannwhitneyu(
+            retained_sample,
+            transitioned_sample,
+            alternative="two-sided",
+            method="auto"
+        )
+
+        bootstrap_effects[i] = (
+            1 -
+            (2 * u_boot) /
+            (n_retained * n_transitioned)
+        )
+
+    lower = np.percentile(
+        bootstrap_effects,
+        2.5
+    )
+
+    upper = np.percentile(
+        bootstrap_effects,
+        97.5
+    )
+
+    return r_obs, lower, upper
+
+mw_results = []
+
+for (model_name, perturbation), subset in exp3_all.groupby(
+    ["model", "perturbation"]
+):
+
+    retained = subset.loc[
+        subset["judgement"] == "Retained",
+        "representation_shift"
+    ].dropna()
+
+    transitioned = subset.loc[
+        subset["judgement"] == "Transitioned",
+        "representation_shift"
+    ].dropna()
+
+    if len(retained) == 0 or len(transitioned) == 0:
+        continue
+
+    u_stat, p_value = mannwhitneyu(
+        retained,
+        transitioned,
+        alternative="two-sided",
+        method="auto"
+    )
+    
+    n_retained = len(retained)
+    n_transitioned = len(transitioned)
+    
+    rank_biserial = (
+        1 -
+        (2 * u_stat) /
+        (n_retained * n_transitioned)
+        )
+
+    _, rb_ci_lower, rb_ci_upper = rank_biserial_ci(
+        retained,
+        transitioned,
+        n_boot=5000,
+        seed=42
+    )
+    
+    q1_retained = retained.quantile(0.25)
+    q3_retained = retained.quantile(0.75)
+
+    q1_transitioned = transitioned.quantile(0.25)
+    q3_transitioned = transitioned.quantile(0.75)
+
+    mw_results.append({
+        "Model": model_name,
+        "Perturbation": perturbation,
+        "N_Retained": len(retained),
+        "N_Transitioned": len(transitioned),
+        "Median_Retained": retained.median(),
+        "Median_Transitioned": transitioned.median(),
+        "U_statistic": u_stat,
+        "Rank_Biserial": rank_biserial,
+        "Rank_Biserial_CI_Lower": rb_ci_lower,
+        "Rank_Biserial_CI_Upper": rb_ci_upper,
+        "p_value": p_value,
+        "Q1_Retained": q1_retained,
+        "Q3_Retained": q3_retained,
+        "IQR_Retained": q3_retained - q1_retained, 
+        "Q1_Transitioned": q1_transitioned,
+        "Q3_Transitioned": q3_transitioned,
+        "IQR_Transitioned": q3_transitioned - q1_transitioned,
+    })
+
+mw_table = pd.DataFrame(mw_results)
+
+if not mw_table.empty:
+
+    mw_table["p_adjusted"] = multipletests(
+        mw_table["p_value"],
+        method="fdr_bh"
+    )[1]
+
+    mw_table["Significant"] = (
+        mw_table["p_adjusted"] < 0.05
+    )
+
+    print("EXP3 MANN–WHITNEY U TEST RESULTS")
+
+    print(
+        mw_table.round(4).to_string(index=False)
+    ) 
