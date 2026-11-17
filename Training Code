@@ -13,7 +13,7 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 
 
-# Reproducibility
+###################### Reproducibility #########################
 
 def set_seed(seed):
     try:
@@ -34,7 +34,7 @@ def set_seed(seed):
     torch.use_deterministic_algorithms(True)
 
 
-# Loading Dataset
+##################### Loading Dataset ##########################
 
 class ASAGDataset(Dataset):
 
@@ -85,7 +85,7 @@ class ASAGDataset(Dataset):
         return item
 
 
-# Model
+########################## Model ##############################
 
 class EncoderClassifier(nn.Module):
 
@@ -114,7 +114,7 @@ class EncoderClassifier(nn.Module):
         return logits
 
 
-# Evaluation
+######################### Evaluation ############################
 
 def evaluate(model, loader, device):
 
@@ -165,7 +165,7 @@ def evaluate(model, loader, device):
     return f1, total_loss / len(loader)
 
 
-# Training
+############################### Training #################################
 
 def train(
     model,
@@ -276,7 +276,7 @@ def train(
     )
 
 
-# Main section
+#################################### Main section ########################################
 
 def main(seed=42):
 
