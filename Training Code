@@ -354,7 +354,7 @@ def main(seed=42):
         lr=2e-5,
         epochs=15,
         patience=3,
-        save_path=f"{model_name.split('/')[-1]}_seed_{seed}_02.pt"
+        save_path=f"{model_name.split('/')[-1]}_seed_{seed}.pt"
     )
 
 
