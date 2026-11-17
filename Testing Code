@@ -19,30 +19,31 @@ from statsmodels.stats.multitest import multipletests
 ####################### Paths to test sets and models #############################
 
 
-ORTHO_PATH = r"D:\ASAG FINAL\Dataset\ScientsBank\SciEntsBank_Orthographic_01all.xlsx"
-PARA_PATH  = r"D:\ASAG FINAL\Dataset\ScientsBank\SciEntsBank_Paraphrased_01all.xlsx"
+ORTHO_PATH = r"Path to orthographic error dataset (excel file). (File name ending with 01all = RTE; ending with 02all = RCC)"
+PARA_PATH  = r"Path to paraphrased answer dataset (excel file). (File name ending with 01all = RTE; ending with 02all = RCC)"
 
-
+#################### Use models with names ending with "seed42_01" to test RTE models,
+#################### and the same ending with "seed42_02" to test RCC models from the provided models
 MODELS = [
     {
         "name": "BERT",
-        "path": r"D:\ASAG FINAL\Models\BERT\bert-base-cased_ASAG_seed42_01"
+        "path": r"path to the BERT model folder"
     },
     {
         "name": "RoBERTa",
-        "path": r"D:\ASAG FINAL\Models\RoBERTa\roberta-base_ASAG_seed42_01"
+        "path": r"path to the RoBERTa model folder"
     },
     {
         "name": "DeBERTa",
-        "path": r"D:\ASAG FINAL\Models\DeBERTa\deberta-base_ASAG_seed42_01"
+        "path": r"path to the DeBERTa model folder"
     },
     {
         "name": "ELECTRA",
-        "path": r"D:\ASAG FINAL\Models\ELECTRA\electra-base-discriminator_ASAG_seed42_01"
+        "path": r"path to the ELECTRA model folder"
     },
     {
         "name": "MPNet",
-        "path": r"D:\ASAG FINAL\Models\MPNet\mpnet-base_ASAG_seed42_01"
+        "path": r"path to the MPNet model folder"
     }
 ]
 
