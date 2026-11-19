@@ -1,0 +1,7 @@
+{
+    "model_name": "roberta-base",
+    "num_labels": 3,
+    "hidden_size": 768,
+    "seed": 42,
+    "architecture": "EncoderClassifier"
+}
