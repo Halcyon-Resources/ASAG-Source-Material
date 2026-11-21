@@ -293,8 +293,6 @@ def main(seed=42):
         "SciEntsBank training dataset path goes here"
     )
 
-    # Remove hash from the model name to use specific model only
-
     model_name = "Name of the model to use"
 
     # Training - validation split
